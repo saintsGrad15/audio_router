@@ -2,6 +2,7 @@
 #include <CoreAudio/CoreAudio.h>
 #include <math.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,25 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+#define SINE_TABLE_SIZE 1024
+static float g_sine_table[SINE_TABLE_SIZE];
+
+static void init_sine_table(void) {
+    for (int i = 0; i < SINE_TABLE_SIZE; i++)
+        g_sine_table[i] = (float)sin(2.0 * M_PI * i / SINE_TABLE_SIZE);
+}
+
+static float fast_sin(double phase) {
+    double normalized = phase / (2.0 * M_PI);
+    normalized -= floor(normalized);
+    double index_f = normalized * SINE_TABLE_SIZE;
+    int index = (int)index_f;
+    double frac = index_f - index;
+    float a = g_sine_table[index];
+    float b = g_sine_table[(index + 1) % SINE_TABLE_SIZE];
+    return (float)(a + frac * (b - a));
+}
 
 typedef struct {
     AudioDeviceID device_id;
@@ -27,9 +47,6 @@ static AudioUnit g_output_au = NULL;
 static void signal_handler(int sig) {
     (void)sig;
     g_running = 0;
-    if (g_output_au) AudioOutputUnitStop(g_output_au);
-    if (g_input_au) AudioOutputUnitStop(g_input_au);
-    if (g_au) AudioOutputUnitStop(g_au);
 }
 
 static OSStatus get_audio_devices(DeviceInfo *devices, int *count) {
@@ -80,8 +97,16 @@ static OSStatus get_audio_devices(DeviceInfo *devices, int *count) {
         UInt32 ch_size = 0;
         AudioObjectGetPropertyDataSize(device_ids[i], &ch_prop,
                                        0, NULL, &ch_size);
-        AudioBufferList *buf_list = (AudioBufferList *)malloc(ch_size);
-        if (!buf_list) continue;
+        char ch_stack_buf[1024];
+        AudioBufferList *buf_list;
+        int used_malloc = 0;
+        if (ch_size <= sizeof(ch_stack_buf)) {
+            buf_list = (AudioBufferList *)ch_stack_buf;
+        } else {
+            buf_list = (AudioBufferList *)malloc(ch_size);
+            if (!buf_list) continue;
+            used_malloc = 1;
+        }
 
         AudioObjectGetPropertyData(device_ids[i], &ch_prop,
                                    0, NULL, &ch_size, buf_list);
@@ -89,13 +114,17 @@ static OSStatus get_audio_devices(DeviceInfo *devices, int *count) {
         int in_channels = 0;
         for (UInt32 b = 0; b < buf_list->mNumberBuffers; b++)
             in_channels += buf_list->mBuffers[b].mNumberChannels;
-        free(buf_list);
+        if (used_malloc) free(buf_list);
 
         ch_prop.mScope = kAudioDevicePropertyScopeOutput;
         AudioObjectGetPropertyDataSize(device_ids[i], &ch_prop,
                                        0, NULL, &ch_size);
-        buf_list = (AudioBufferList *)malloc(ch_size);
-        if (!buf_list) continue;
+        if (ch_size <= sizeof(ch_stack_buf)) {
+            buf_list = (AudioBufferList *)ch_stack_buf;
+        } else {
+            buf_list = (AudioBufferList *)malloc(ch_size);
+            if (!buf_list) continue;
+        }
 
         AudioObjectGetPropertyData(device_ids[i], &ch_prop,
                                    0, NULL, &ch_size, buf_list);
@@ -103,7 +132,7 @@ static OSStatus get_audio_devices(DeviceInfo *devices, int *count) {
         int out_channels = 0;
         for (UInt32 b = 0; b < buf_list->mNumberBuffers; b++)
             out_channels += buf_list->mBuffers[b].mNumberChannels;
-        free(buf_list);
+        if (ch_size > sizeof(ch_stack_buf)) free(buf_list);
 
         if (in_channels > 0 || out_channels > 0) {
             devices[found].device_id = device_ids[i];
@@ -261,9 +290,12 @@ typedef struct {
     int input_interleaved;
     int test_mode;
     double phase;
-    volatile float peak_l;
-    volatile float peak_r;
+    double sample_rate;
+    _Atomic float peak_l;
+    _Atomic float peak_r;
 } RenderContext;
+
+static RenderContext *g_render_ctx = NULL;
 
 static OSStatus same_device_input_callback(
     void *in_ref_con,
@@ -315,14 +347,14 @@ static OSStatus render_callback(
 
     if (ctx->test_mode) {
         double freq = 440.0;
-        double sr = 44100.0;
+        double sr = ctx->sample_rate;
         double amplitude = 0.3;
         for (UInt32 buf = 0; buf < io_data->mNumberBuffers; buf++) {
             float *data = (float *)io_data->mBuffers[buf].mData;
             UInt32 ch = io_data->mBuffers[buf].mNumberChannels;
             if (ch == 0) ch = 1;
             for (UInt32 s = 0; s < in_number_frames; s++) {
-                float sample = (float)(amplitude * sin(ctx->phase));
+                float sample = amplitude * fast_sin(ctx->phase);
                 for (UInt32 c = 0; c < ch; c++)
                     data[s * ch + c] = sample;
                 ctx->phase += 2.0 * M_PI * freq / sr;
@@ -358,8 +390,8 @@ static OSStatus render_callback(
     return noErr;
 }
 
-static volatile float g_meter_peak_l = 0.0f;
-static volatile float g_meter_peak_r = 0.0f;
+static _Atomic float g_meter_peak_l = 0.0f;
+static _Atomic float g_meter_peak_r = 0.0f;
 static AudioBufferList *g_meter_input_buf = NULL;
 
 static OSStatus meter_input_callback(
@@ -660,6 +692,7 @@ static int setup_audio(AudioDeviceID input_dev, AudioDeviceID output_dev,
 
         RenderContext *ctx = (RenderContext *)calloc(1, sizeof(RenderContext));
         ctx->test_mode = 1;
+        ctx->sample_rate = fmt.mSampleRate;
 
         AURenderCallbackStruct cb = { .inputProc = render_callback, .inputProcRefCon = ctx };
         AudioUnitSetProperty(g_output_au, kAudioUnitProperty_SetRenderCallback,
@@ -667,6 +700,7 @@ static int setup_audio(AudioDeviceID input_dev, AudioDeviceID output_dev,
 
         AudioUnitInitialize(g_output_au);
         AudioOutputUnitStart(g_output_au);
+        g_render_ctx = ctx;
         return 0;
     }
 
@@ -711,6 +745,7 @@ static int setup_audio(AudioDeviceID input_dev, AudioDeviceID output_dev,
         RenderContext *ctx = (RenderContext *)calloc(1, sizeof(RenderContext));
         ctx->input_channels = ifmt.mChannelsPerFrame;
         ctx->input_interleaved = !(ifmt.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
+        ctx->sample_rate = ofmt.mSampleRate;
 
         UInt32 nb, cb_val, bpb;
         if (ctx->input_interleaved) {
@@ -741,6 +776,7 @@ static int setup_audio(AudioDeviceID input_dev, AudioDeviceID output_dev,
 
         AudioUnitInitialize(g_au);
         AudioOutputUnitStart(g_au);
+        g_render_ctx = ctx;
         return 0;
     }
 
@@ -836,6 +872,7 @@ static int setup_audio(AudioDeviceID input_dev, AudioDeviceID output_dev,
     RenderContext *ctx = (RenderContext *)calloc(1, sizeof(RenderContext));
     ctx->input_channels = input_format.mChannelsPerFrame;
     ctx->input_interleaved = !(input_format.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
+    ctx->sample_rate = output_format.mSampleRate;
 
     UInt32 nb, cpb, bpb;
     if (ctx->input_interleaved) {
@@ -899,7 +936,26 @@ static int setup_audio(AudioDeviceID input_dev, AudioDeviceID output_dev,
         return 1;
     }
 
+    g_render_ctx = ctx;
     return 0;
+}
+
+static void free_render_context(RenderContext *ctx) {
+    if (!ctx) return;
+    if (ctx->input_buf) {
+        for (UInt32 b = 0; b < ctx->input_buf->mNumberBuffers; b++)
+            free(ctx->input_buf->mBuffers[b].mData);
+        free(ctx->input_buf);
+    }
+    free(ctx);
+}
+
+static void free_meter_buffers(void) {
+    if (!g_meter_input_buf) return;
+    for (UInt32 b = 0; b < g_meter_input_buf->mNumberBuffers; b++)
+        free(g_meter_input_buf->mBuffers[b].mData);
+    free(g_meter_input_buf);
+    g_meter_input_buf = NULL;
 }
 
 int main(int argc, char *argv[]) {
@@ -909,6 +965,8 @@ int main(int argc, char *argv[]) {
     int do_list = 0;
     int test_mode = 0;
     int meter_mode = 0;
+
+    init_sine_table();
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-l") == 0) {
@@ -987,6 +1045,8 @@ int main(int argc, char *argv[]) {
             AudioComponentInstanceDispose(g_input_au);
         }
 
+        free_meter_buffers();
+
         printf("Done.\n");
         return 0;
     }
@@ -1046,6 +1106,9 @@ int main(int argc, char *argv[]) {
         AudioUnitUninitialize(g_au);
         AudioComponentInstanceDispose(g_au);
     }
+
+    free_render_context(g_render_ctx);
+    g_render_ctx = NULL;
 
     printf("Done.\n");
     return 0;
