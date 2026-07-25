@@ -72,6 +72,6 @@ In event-driven terms: the broken code was polling (`give me data now`), when it
 
 ## Authorship
 
-This code was written entirely by [OpenCode|https://opencode.ai/] and the "Big Pickle" model. OpenCode is an open source alternative to Claude Code and Big Pickle is a hosted, free-to-use model.
+This code was written entirely by [OpenCode](https://opencode.ai/) and the "Big Pickle" model. OpenCode is an open source alternative to Claude Code and Big Pickle is a hosted, free-to-use model.
 
 I'm a software engineer but I do not write C. I didn't personally review the code though I did clear context and ask Big Pickle to review the code and look for memory leaks and performance opportunities.
