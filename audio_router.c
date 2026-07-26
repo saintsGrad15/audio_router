@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #define kMaxDevices 64
+#define RING_BUF_CAPACITY 64
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -285,7 +286,9 @@ static void print_usage(const char *prog) {
 }
 
 typedef struct {
-    AudioBufferList *input_buf;
+    AudioBufferList *ring[RING_BUF_CAPACITY];
+    _Atomic UInt32 write_pos;
+    _Atomic UInt32 read_pos;
     UInt32 input_channels;
     int input_interleaved;
     int test_mode;
@@ -309,8 +312,15 @@ static OSStatus same_device_input_callback(
 
     RenderContext *ctx = (RenderContext *)in_ref_con;
 
+    UInt32 wp = atomic_load_explicit(&ctx->write_pos, memory_order_relaxed);
+    UInt32 rp = atomic_load_explicit(&ctx->read_pos, memory_order_acquire);
+    UInt32 next_wp = (wp + 1) % RING_BUF_CAPACITY;
+    if (next_wp == rp) return noErr;
+
     OSStatus err = AudioUnitRender(g_au, io_action_flags, in_time_stamp,
-                                   1, in_number_frames, ctx->input_buf);
+                                   1, in_number_frames, ctx->ring[wp]);
+    if (err == noErr)
+        atomic_store_explicit(&ctx->write_pos, next_wp, memory_order_release);
     return err;
 }
 
@@ -326,8 +336,15 @@ static OSStatus route_input_callback(
 
     RenderContext *ctx = (RenderContext *)in_ref_con;
 
+    UInt32 wp = atomic_load_explicit(&ctx->write_pos, memory_order_relaxed);
+    UInt32 rp = atomic_load_explicit(&ctx->read_pos, memory_order_acquire);
+    UInt32 next_wp = (wp + 1) % RING_BUF_CAPACITY;
+    if (next_wp == rp) return noErr;
+
     OSStatus err = AudioUnitRender(g_input_au, io_action_flags, in_time_stamp,
-                                   1, in_number_frames, ctx->input_buf);
+                                   1, in_number_frames, ctx->ring[wp]);
+    if (err == noErr)
+        atomic_store_explicit(&ctx->write_pos, next_wp, memory_order_release);
     return err;
 }
 
@@ -360,10 +377,23 @@ static OSStatus render_callback(
                 ctx->phase += 2.0 * M_PI * freq / sr;
             }
         }
+        ctx->phase = fmod(ctx->phase, 2.0 * M_PI);
         return noErr;
     }
 
-    UInt32 input_bufs = ctx->input_buf->mNumberBuffers;
+    UInt32 rp = atomic_load_explicit(&ctx->read_pos, memory_order_relaxed);
+    UInt32 wp = atomic_load_explicit(&ctx->write_pos, memory_order_acquire);
+
+    if (rp == wp) {
+        for (UInt32 b = 0; b < io_data->mNumberBuffers; b++)
+            memset(io_data->mBuffers[b].mData, 0, io_data->mBuffers[b].mDataByteSize);
+        return noErr;
+    }
+
+    AudioBufferList *in_buf = ctx->ring[rp];
+    atomic_store_explicit(&ctx->read_pos, (rp + 1) % RING_BUF_CAPACITY, memory_order_release);
+
+    UInt32 input_bufs = in_buf->mNumberBuffers;
     UInt32 output_bufs = io_data->mNumberBuffers;
 
     if (ctx->input_interleaved && input_bufs == 1 && output_bufs > 1) {
@@ -371,7 +401,7 @@ static OSStatus render_callback(
             UInt32 bytes = io_data->mBuffers[ch].mDataByteSize;
             if (bytes > in_number_frames * sizeof(float))
                 bytes = in_number_frames * sizeof(float);
-            float *src = (float *)ctx->input_buf->mBuffers[0].mData + ch;
+            float *src = (float *)in_buf->mBuffers[0].mData + ch;
             float *dst = (float *)io_data->mBuffers[ch].mData;
             for (UInt32 s = 0; s < bytes / sizeof(float); s++)
                 dst[s] = src[s * ctx->input_channels];
@@ -380,10 +410,10 @@ static OSStatus render_callback(
         UInt32 bufs = input_bufs < output_bufs ? input_bufs : output_bufs;
         for (UInt32 b = 0; b < bufs; b++) {
             UInt32 bytes = io_data->mBuffers[b].mDataByteSize;
-            if (bytes > ctx->input_buf->mBuffers[b].mDataByteSize)
-                bytes = ctx->input_buf->mBuffers[b].mDataByteSize;
+            if (bytes > in_buf->mBuffers[b].mDataByteSize)
+                bytes = in_buf->mBuffers[b].mDataByteSize;
             memcpy(io_data->mBuffers[b].mData,
-                   ctx->input_buf->mBuffers[b].mData, bytes);
+                   in_buf->mBuffers[b].mData, bytes);
         }
     }
 
@@ -757,12 +787,14 @@ static int setup_audio(AudioDeviceID input_dev, AudioDeviceID output_dev,
         }
 
         UInt32 total = sizeof(AudioBufferList) + (nb - 1) * sizeof(AudioBuffer);
-        ctx->input_buf = (AudioBufferList *)calloc(1, total);
-        ctx->input_buf->mNumberBuffers = nb;
-        for (UInt32 b = 0; b < nb; b++) {
-            ctx->input_buf->mBuffers[b].mNumberChannels = cb_val;
-            ctx->input_buf->mBuffers[b].mDataByteSize = bpb;
-            ctx->input_buf->mBuffers[b].mData = calloc(1, bpb);
+        for (int i = 0; i < RING_BUF_CAPACITY; i++) {
+            ctx->ring[i] = (AudioBufferList *)calloc(1, total);
+            ctx->ring[i]->mNumberBuffers = nb;
+            for (UInt32 b = 0; b < nb; b++) {
+                ctx->ring[i]->mBuffers[b].mNumberChannels = cb_val;
+                ctx->ring[i]->mBuffers[b].mDataByteSize = bpb;
+                ctx->ring[i]->mBuffers[b].mData = calloc(1, bpb);
+            }
         }
 
         AURenderCallbackStruct input_cbstruct = { .inputProc = same_device_input_callback,
@@ -884,12 +916,14 @@ static int setup_audio(AudioDeviceID input_dev, AudioDeviceID output_dev,
     }
 
     UInt32 total = sizeof(AudioBufferList) + (nb - 1) * sizeof(AudioBuffer);
-    ctx->input_buf = (AudioBufferList *)calloc(1, total);
-    ctx->input_buf->mNumberBuffers = nb;
-    for (UInt32 b = 0; b < nb; b++) {
-        ctx->input_buf->mBuffers[b].mNumberChannels = cpb;
-        ctx->input_buf->mBuffers[b].mDataByteSize = bpb;
-        ctx->input_buf->mBuffers[b].mData = calloc(1, bpb);
+    for (int i = 0; i < RING_BUF_CAPACITY; i++) {
+        ctx->ring[i] = (AudioBufferList *)calloc(1, total);
+        ctx->ring[i]->mNumberBuffers = nb;
+        for (UInt32 b = 0; b < nb; b++) {
+            ctx->ring[i]->mBuffers[b].mNumberChannels = cpb;
+            ctx->ring[i]->mBuffers[b].mDataByteSize = bpb;
+            ctx->ring[i]->mBuffers[b].mData = calloc(1, bpb);
+        }
     }
 
     AURenderCallbackStruct input_cb = { .inputProc = route_input_callback,
@@ -942,10 +976,12 @@ static int setup_audio(AudioDeviceID input_dev, AudioDeviceID output_dev,
 
 static void free_render_context(RenderContext *ctx) {
     if (!ctx) return;
-    if (ctx->input_buf) {
-        for (UInt32 b = 0; b < ctx->input_buf->mNumberBuffers; b++)
-            free(ctx->input_buf->mBuffers[b].mData);
-        free(ctx->input_buf);
+    for (int i = 0; i < RING_BUF_CAPACITY; i++) {
+        if (ctx->ring[i]) {
+            for (UInt32 b = 0; b < ctx->ring[i]->mNumberBuffers; b++)
+                free(ctx->ring[i]->mBuffers[b].mData);
+            free(ctx->ring[i]);
+        }
     }
     free(ctx);
 }

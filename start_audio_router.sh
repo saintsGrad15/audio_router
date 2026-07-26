@@ -1,12 +1,13 @@
 #!/bin/bash
 
 AUDIO_ROUTER="/Users/jcarrell/Documents/repos/audio_router/audio_router"
+BUFFER_SIZE=32
 
-if "$AUDIO_ROUTER" -b 128 -i GX -o 2i2; then
+if "$AUDIO_ROUTER" -b "$BUFFER_SIZE" -i GX -o 2i2; then
     exit 0
 fi
 
-if "$AUDIO_ROUTER" -b 128 -i GX -o "MacBook Pro Speakers" -b 128; then
+if "$AUDIO_ROUTER" -b "$BUFFER_SIZE" -i GX -o "MacBook Pro Speakers" -b 128; then
     exit 0
 fi
 
